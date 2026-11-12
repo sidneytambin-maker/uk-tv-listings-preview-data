@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths: ['*.py', 'catalog.json', '.github/workflows/refresh.yml']
   schedule:
-    - cron: '13,43 * * * *'
+    - cron: '17,47 * * * *'
 permissions:
   contents: read
 concurrency:
