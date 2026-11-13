@@ -26,6 +26,11 @@ def validate_data(value,manifest,now):
         if not isinstance(cid,str) or not cid.isdigit() or not isinstance(channel,dict) or not isinstance(channel.get('name'),str) or not isinstance(channel.get('xmltv_id'),str):raise ValueError('Invalid channel identity')
     if any(not isinstance(s,str) or len(s)>1000 or not s for s in titles):raise ValueError('Invalid title')
     if any(not isinstance(s,str) or len(s)>20000 for s in descriptions):raise ValueError('Invalid description')
+    revisions=value.get('revisions',{})
+    if not isinstance(revisions,dict) or len(revisions)>100000:raise ValueError('Invalid revision table')
+    for url,stamp in revisions.items():
+        if (not isinstance(url,str) or not re.fullmatch(r'https://(?:www\.)?ontvnow\.co\.uk/programmes/\d+',url)
+                or not isinstance(stamp,int) or isinstance(stamp,bool) or stamp>now+300):raise ValueError('Invalid revision evidence')
     for p in rows:
         if not isinstance(p,list) or len(p)!=8 or not all(isinstance(p[n],int) and not isinstance(p[n],bool) for n in (0,1,3,4)):raise ValueError('Invalid row')
         a,b,c,ti,di,url,off,conflict=p

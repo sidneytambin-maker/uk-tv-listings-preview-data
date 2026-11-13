@@ -2,22 +2,84 @@
 import argparse,datetime as dt,gzip,hashlib,json,pathlib,re,time,urllib.parse,urllib.request
 import xml.etree.ElementTree as ET
 import sys
+from collections import defaultdict
+from urllib.error import HTTPError, URLError
 from zoneinfo import ZoneInfo
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]/'src'))
 
 BASE='https://www.ontvnow.co.uk/api/v1/'
 MAX_XML=50_000_000
 
+_last_fetch=0.0
+
 def fetch(path,params=None):
-    began=time.monotonic()
+    global _last_fetch
     url=BASE+path+('?' + urllib.parse.urlencode(params) if params else '')
-    request=urllib.request.Request(url,headers={'User-Agent':'UKTVListingsPreviewBackground/1.0'})
-    # Slow source calls happen here, never in a listener's Alexa request.
-    with urllib.request.urlopen(request,timeout=90) as response:
-        data=response.read(MAX_XML+1)
-    if len(data)>MAX_XML:raise ValueError('Source exceeds size limit')
-    print(json.dumps({'feed':path,'bytes':len(data),'seconds':round(time.monotonic()-began,2)}),flush=True)
-    return data
+    request=urllib.request.Request(url,headers={'User-Agent':'UKTVListingsPreviewBackground/1.1'})
+    # At most 40 source requests/minute, including retries. Cloud work never
+    # occupies an Alexa request, and a failure never replaces the published guide.
+    for attempt in range(3):
+        time.sleep(max(0,1.5-(time.monotonic()-_last_fetch)))
+        _last_fetch=time.monotonic();began=_last_fetch
+        try:
+            with urllib.request.urlopen(request,timeout=90) as response:
+                data=response.read(MAX_XML+1)
+            if len(data)>MAX_XML:raise ValueError('Source exceeds size limit')
+            print(json.dumps({'feed':path,'bytes':len(data),'seconds':round(time.monotonic()-began,2)}),flush=True)
+            return data
+        except (HTTPError,URLError,TimeoutError) as error:
+            if isinstance(error,HTTPError) and error.code not in (429,500,502,503,504):raise
+            if attempt==2:raise
+            time.sleep(5*(attempt+1))
+
+
+def conflicted_rows(rows):
+    active=[];conflicted=set()
+    for i,p in sorted(enumerate(rows),key=lambda item:(item[1][2],item[1][0],item[1][1])):
+        active=[(j,q) for j,q in active if q[2]==p[2] and q[1]>p[0]]
+        if active:conflicted.add(i);conflicted.update(j for j,q in active)
+        active.append((i,p))
+    return conflicted
+
+
+def reconcile_conflicts(rows,fetcher,now):
+    """Resolve XMLTV overlaps only using matching JSON source revision evidence."""
+    conflicts=conflicted_rows(rows)
+    groups=set()
+    for i in conflicts:
+        p=rows[i]
+        # A source day query includes a broadcast that crosses its boundary.
+        groups.add((p[2],dt.datetime.fromtimestamp(p[0],ZoneInfo('Europe/London')).date().isoformat()))
+    revisions={};requests=0
+    by_url={p[5]:p for p in rows if p[5]}
+    for cid,day in sorted(groups):
+        page=1
+        while True:
+            body=json.loads(fetcher('listings',dict(channel_id=cid,date=day,period='day',limit=100,page=page)))
+            requests+=1;meta=body['meta'];stamp=instant(meta['generated_at'])
+            if not now-3600<=stamp<=int(time.time())+300:raise ValueError('Stale revision metadata')
+            if int(meta['last_page'])>10 or int(meta['page'])!=page:raise ValueError('Invalid revision pagination')
+            for item in body['data']:
+                url=item.get('url');p=by_url.get(url)
+                if str(item['channel']['id'])!=cid:raise ValueError('Revision channel mismatch')
+                if not p:continue
+                # Never apply a timestamp to different programme content.
+                identity=[instant(item['starts_at']),instant(item['ends_at']),cid,clean_title(item['title'],item.get('description') or '')]
+                if identity!=p[:4]:raise ValueError('Source changed during import; retry a complete update')
+                updated=item.get('updated_at')
+                if updated is not None:
+                    stamp=instant(updated)
+                    if stamp>int(time.time())+300:raise ValueError('Future revision')
+                    revisions[url]=stamp
+            if page>=int(meta['last_page']):break
+            page+=1
+    kept=[];per_channel=defaultdict(list)
+    for p in sorted(rows,key=lambda p:revisions.get(p[5],-1),reverse=True):
+        overlaps=[q for q in per_channel[p[2]] if p[0]<q[1] and q[0]<p[1]]
+        if overlaps and p[5] in revisions and all(q[5] in revisions and revisions[q[5]]>revisions[p[5]] for q in overlaps):continue
+        kept.append(p);per_channel[p[2]].append(p)
+    return kept,revisions,requests
+
 
 def iso(timestamp):return dt.datetime.fromtimestamp(timestamp,dt.timezone.utc).isoformat()
 def instant(value):
@@ -110,7 +172,10 @@ def build(catalog,output,previous=None):
         raw=fetch('listings.xml',params);requests+=1
         batch,missing,stamp=parse_export(raw,metadata,a,b,known,int(time.time()));rows.extend(batch);unknown.update(missing);generated.append(stamp)
     if len(rows)<1000 or len({p[2] for p in rows})<len(channels)*.8:raise ValueError('Guide unexpectedly small')
+    rows,revisions,revision_requests=reconcile_conflicts(rows,fetch,now)
+    requests+=revision_requests
     result=pack(rows,channels,now,start,end,min(generated),previous)
+    result['revisions']={p[5]:revisions[p[5]] for p in rows if p[5] in revisions}
     encoded=json.dumps(result,separators=(',',':'),ensure_ascii=False).encode('utf8')
     if len(encoded)>12_000_000:raise ValueError('Packed guide exceeds runtime memory budget')
     compressed=gzip.compress(encoded,mtime=0)

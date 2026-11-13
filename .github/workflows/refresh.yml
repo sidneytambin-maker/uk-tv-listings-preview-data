@@ -4,8 +4,6 @@ on:
   push:
     branches: [main]
     paths: ['*.py', 'catalog.json', '.github/workflows/refresh.yml']
-  schedule:
-    - cron: '17,47 * * * *'
 permissions:
   contents: read
 concurrency:
@@ -14,7 +12,7 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 20
     permissions:
       contents: write
       pages: write
