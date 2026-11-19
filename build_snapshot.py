@@ -1,5 +1,5 @@
 """Build the public Preview guide. No listener data or Amazon credentials."""
-import argparse,datetime as dt,gzip,hashlib,json,pathlib,re,time,urllib.parse,urllib.request
+import argparse,datetime as dt,gzip,hashlib,json,pathlib,re,time,urllib.parse,urllib.request,http.client
 import xml.etree.ElementTree as ET
 import sys
 from collections import defaultdict
@@ -11,6 +11,12 @@ BASE='https://www.ontvnow.co.uk/api/v1/'
 MAX_XML=50_000_000
 
 _last_fetch=0.0
+
+class SourceChanged(ValueError):
+    """Two individually valid source responses describe different revisions."""
+
+class RevisionChanged(SourceChanged):
+    """Programme content changed while resolving overlapping revisions."""
 
 def fetch(path,params=None):
     global _last_fetch
@@ -27,7 +33,7 @@ def fetch(path,params=None):
             if len(data)>MAX_XML:raise ValueError('Source exceeds size limit')
             print(json.dumps({'feed':path,'bytes':len(data),'seconds':round(time.monotonic()-began,2)}),flush=True)
             return data
-        except (HTTPError,URLError,TimeoutError) as error:
+        except (HTTPError,URLError,TimeoutError,http.client.IncompleteRead) as error:
             if isinstance(error,HTTPError) and error.code not in (429,500,502,503,504):raise
             if attempt==2:raise
             time.sleep(5*(attempt+1))
@@ -65,7 +71,7 @@ def reconcile_conflicts(rows,fetcher,now):
                 if not p:continue
                 # Never apply a timestamp to different programme content.
                 identity=[instant(item['starts_at']),instant(item['ends_at']),cid,clean_title(item['title'],item.get('description') or '')]
-                if identity!=p[:4]:raise ValueError('Source changed during import; retry a complete update')
+                if identity!=p[:4]:raise RevisionChanged('Source changed during import; retry a complete update')
                 updated=item.get('updated_at')
                 if updated is not None:
                     stamp=instant(updated)
@@ -110,7 +116,8 @@ def parse_export(raw,metadata,start,end,known,now):
     root=ET.fromstring(raw)
     if root.tag!='tv':raise ValueError('Unexpected export')
     elements=root.findall('programme');total=int(metadata['total'])
-    if total>=100000 or len(elements)!=total:raise ValueError('Incomplete export or changed source count')
+    if total>=100000:raise ValueError('Export exceeds supported count')
+    if len(elements)!=total:raise SourceChanged('Incomplete export or changed source count')
     names={c.get('id'):c.findtext('display-name') or '' for c in root.findall('channel')}
     rows=[];seen=set();unknown=set()
     for element in elements:
@@ -153,7 +160,26 @@ def pack(rows,channels,now,start,end,generated,previous=None):
     return dict(schema=1,checked_at=now,source='ontvnow',source_generated_at=generated,window=[start,end],channels=channels,
                 titles=list(titles),descriptions=list(descriptions),rows=packed)
 
-def build(catalog,output,previous=None):
+def fetch_export(start,end,known,fetcher=None):
+    """Retry only the affected window when metadata and XML disagree."""
+    fetcher=fetcher or fetch
+    params={'from':iso(start),'to':iso(end)};requests=0
+    for attempt in range(3):
+        metadata=json.loads(fetcher('listings',dict(params,limit=1)))['meta'];requests+=1
+        if not int(metadata['total']):
+            stamp=instant(metadata['generated_at'])
+            if not int(time.time())-3600<=stamp<=int(time.time())+300:raise ValueError('Stale empty export metadata')
+            return [],[],stamp,requests
+        raw=fetcher('listings.xml',params);requests+=1
+        try:
+            rows,missing,stamp=parse_export(raw,metadata,start,end,known,int(time.time()))
+            return rows,missing,stamp,requests
+        except SourceChanged:
+            if attempt==2:raise
+            print(json.dumps({'event':'source_window_retry','attempt':attempt+1}),flush=True)
+            time.sleep((5,15)[attempt])
+
+def _build(catalog,output,previous=None):
     now=int(time.time());local=dt.datetime.fromtimestamp(now,ZoneInfo('Europe/London'))
     start=int(local.replace(hour=0,minute=0,second=0,microsecond=0).timestamp());end=now+7*86400
     known={c['source_channel_id']:str(c['id']) for c in catalog['channels'] if c.get('source_channel_id') and not c.get('superseded_by')}
@@ -162,15 +188,8 @@ def build(catalog,output,previous=None):
     if len(channels)<len(known)*.9:raise ValueError('Channel identity regression')
     rows=[];unknown=set();generated=[];requests=1
     for a,b in [(start,start+7*86400),(start+7*86400,end)]:
-        params={'from':iso(a),'to':iso(b)}
-        metadata=json.loads(fetch('listings',dict(params,limit=1)))['meta'];requests+=1
-        total=int(metadata['total'])
-        if not total:
-            stamp=instant(metadata['generated_at'])
-            if not now-3600<=stamp<=int(time.time())+300:raise ValueError('Stale empty export metadata')
-            generated.append(stamp);continue
-        raw=fetch('listings.xml',params);requests+=1
-        batch,missing,stamp=parse_export(raw,metadata,a,b,known,int(time.time()));rows.extend(batch);unknown.update(missing);generated.append(stamp)
+        batch,missing,stamp,count=fetch_export(a,b,known)
+        requests+=count;rows.extend(batch);unknown.update(missing);generated.append(stamp)
     if len(rows)<1000 or len({p[2] for p in rows})<len(channels)*.8:raise ValueError('Guide unexpectedly small')
     rows,revisions,revision_requests=reconcile_conflicts(rows,fetch,now)
     requests+=revision_requests
@@ -194,6 +213,16 @@ def build(catalog,output,previous=None):
     (output/'index.html').write_text('<!doctype html><html lang="en-GB"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>UK TV Listings Preview updates</title><main><h1>UK TV Listings Preview updates</h1><p>This free, personal accessibility project by Sidney Tambin prepares a shared programme guide for the private Alexa Preview. It is separate from Inclusophy Ltd.</p><p>Listings are supplied by <a href="https://www.ontvnow.co.uk/data-access">onTVnow</a>. Coverage and schedules can change. Missing listings do not prove a channel is off air. Programme links in the data refer to the source.</p><p>The guide is scheduled to refresh about every 30 minutes. Updates can be delayed. Failed checks retain the previous published guide. No listener information is collected by this update process.</p><p><a href="status.json">Latest update status (JSON)</a>. <a href="https://tv-listings-by-sidney.luckyledge3.chatgpt.site">Skill help and privacy</a>.</p></main></html>',encoding='utf8')
     print(json.dumps({k:v for k,v in report.items() if k not in ('file','sha256','unknown_source_channels')}))
     return result
+
+def build(catalog,output,previous=None):
+    # Revision identity changes require a complete fresh collection. A second
+    # source change or any other validation error leaves publication untouched.
+    for attempt in range(2):
+        try:return _build(catalog,output,previous)
+        except RevisionChanged:
+            if attempt:raise
+            print(json.dumps({'event':'source_collection_retry'}),flush=True)
+            time.sleep(5)
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser();parser.add_argument('--catalog',default='catalog.json');parser.add_argument('--output',default='site');parser.add_argument('--previous')

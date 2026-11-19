@@ -1,5 +1,5 @@
 """Bounded validation/decoding shared by the background builder and skill."""
-import gzip,hashlib,io,json,re,time,urllib.request,urllib.error
+import gzip,hashlib,io,json,re,time,urllib.request,urllib.error,http.client
 
 MAX_JSON=12_000_000
 MAX_GZIP=4_000_000
@@ -52,7 +52,7 @@ def download(url,limit,timeout):
     if len(body)>limit:raise ValueError('Response exceeds limit')
     return body
 
-def download_previous(base):
+def _download_previous(base):
     now=int(time.time())
     try:
         candidate=json.loads(download(base+'/current.json',16000,15))
@@ -64,6 +64,18 @@ def download_previous(base):
         result=decode(raw,manifest,check_time)
         result.update(_previous_manifest=manifest,_previous_bytes=raw)
         return result
-    except urllib.error.HTTPError as error:
-        if error.code==404:return None
+    except urllib.error.HTTPError:
+        # A temporarily missing file must not silently disable comparison with
+        # the last good guide. This is an established publication, not bootstrap.
         raise
+
+def download_previous(base):
+    """Retry the manifest/file pair, retaining all integrity/coverage checks."""
+    for attempt in range(3):
+        try:
+            return _download_previous(base)
+        except (urllib.error.URLError,TimeoutError,http.client.IncompleteRead) as error:
+            if isinstance(error,urllib.error.HTTPError) and error.code not in (404,408,429,500,502,503,504):raise
+            if attempt==2:raise
+            print(json.dumps({'event':'previous_guide_retry','attempt':attempt+1}),flush=True)
+            time.sleep((5,15)[attempt])
